@@ -1,0 +1,1097 @@
+---
+title: "MAA RNA-Seq analysis"
+author: "Karol Cichewicz"
+output:
+  html_document:
+    code_folding: hide
+    css: style.css
+    df_print: default
+    theme: spacelab
+    toc: yes
+    toc_depth: 4
+  pdf_document:
+    toc: yes
+    toc_depth: '4'
+urlcolor: blue
+---
+
+
+```{r, message=FALSE, error=FALSE, echo=TRUE, cache=FALSE}
+
+library(sva)
+library(RUVnormalize)
+library(pheatmap)
+library(edgeR)
+library(GenomicFeatures)
+library(mclust)
+library(parallel)
+library(ggplot2)
+library(reshape2)
+library(dplyr)
+library(data.table)
+library(DT)
+library(RColorBrewer)
+library(knitr)
+library(ggrepel)
+library(gridExtra)
+library(grid)
+library(plyr)
+library(plotly)
+library(Hmisc)
+
+```
+
+
+# RNA-Seq differential expression of MAA model 
+
+Dataset includes: "frontal cortex", "Extracted frontal cortex only", and "Forebrain" samples 
+
+```{r RNA-seq 1, fig.height = 10, fig.width = 14, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, dev='png', dpi=72, cache=TRUE, fig.cap=""}
+### genreate rn5 annotation data ###
+if (exists("exonic.gene.sizes")==F) {
+  txdb <- makeTxDbFromGFF("G:/Shared drives/Nord Lab - Data/MIAx01/RNA/Rattus_norvegicus.Rnor_6.0.90.gtf",format="gtf")
+  exons.list.per.gene <- exonsBy(txdb,by="gene")
+  exonic.gene.sizes <- lapply(exons.list.per.gene,function(x){sum(width(reduce(x)))})
+}
+
+setwd("G:/Shared drives/Nord Lab - Data/MIAx01/RNA")
+
+min.cpm <- 5
+cpm.sample.cutoff <- 2
+
+# load count tables
+my.data.1 <- read.table("Project_ANIZ_L1_H1144P_Zdilar_GENE_MATRIX.txt", sep="\t", header=T, as.is=T, stringsAsFactors = F)
+rownames(my.data.1) <- as.character(my.data.1[,1])
+my.data.1 <- my.data.1[,c(1:9)]
+my.data.2 <- read.table("Project_ANIZ_L5_H1145P_Zdilar_GENE_MATRIX.txt", sep="\t", header=T, as.is=T, stringsAsFactors = F)
+rownames(my.data.2) <- as.character(my.data.2[,1])
+my.data.2 <- my.data.2[,c(1:8)]
+
+#This is reading the new dataset
+setwd("G:/Shared drives/Nord Lab - Data/MIAx01/")
+
+my.data.3 <- read.table("Project_ANIZ_H1376P_Zdilar_GENE_MATRIX.txt", sep="\t", header=T, as.is=T, stringsAsFactors = F)
+rownames(my.data.3) <- as.character(my.data.3[,1])
+
+setwd("G:/Shared drives/Nord Lab - Personal Folders/Karol/MIAx01/Lane 3 of 3")
+my.data.4 <- read.table("GENE_MATRIX.txt", sep="\t", header=T, as.is=T, stringsAsFactors = F)
+rownames(my.data.4) <- as.character(my.data.4[,1])
+
+#file making my.data.3 is identical to th file making my.data.4. I copied the my.data.4 file from the cluster today, as directed by Rinaldo.
+
+#Let's merge those files together
+my.data <- merge(my.data.1, my.data.2, by="gene_id", all.x=T, all.y=T)
+my.data <- merge(my.data, my.data.3, by="gene_id", all.x=T, all.y=T)
+
+rownames(my.data) <- as.character(my.data[,1])
+#dim(my.data)
+#colnames(my.data)
+
+#I'll quickly check the older gene matrix files and compare the colnames with the new version
+setwd("G:/Shared drives/Nord Lab - Data/MIAx01/RNA")
+test.file <-  read.table("MAA_GENE_MATRIX.txt", sep="\t", header=T, as.is=T, stringsAsFactors = F)
+#dim(test.file)
+#colnames(test.file)
+#Great, test.file contains an older version of this analysis. 
+
+```
+
+
+```{r RNA-seq 2, fig.height = 10, fig.width = 14, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, dev='png', dpi=72, cache=FALSE, fig.cap=""}
+setwd("G:/Shared drives/Nord Lab - Personal Folders/Karol/MIAx01/RNA")
+# details on each sample
+sample.info <- read.table("MAA_SampleInfo_complete.txt", sep="\t", header=T, as.is=T, stringsAsFactors = F)
+
+#In addition to frontal cortex I'm adding Forebrain samples. There are no frontal cortex samples in the new batch. I had to manually add 0s to the outlier columns, because I haven't found the original information in metafiles yet. 
+
+#There are the following brain regions in the dataset: 
+#[1] "frontal cortex"                "whole brain"                  
+#[3] "Extracted frontal cortex only" "Forebrain"      
+#Consult Alex about that. 
+
+#dim(sample.info)
+#head(my.data)
+
+# select samples for analysis
+use.samples <- sample.info[which(sample.info[,"Region"] %in% c("frontal cortex", "Forebrain", "Extracted frontal cortex only") & sample.info[,"Outlier"]==0),"Sample_ID"]
+
+use.samples.rows <- which(sample.info[,"Region"] %in% c("frontal cortex", "Forebrain", "Extracted frontal cortex only") & sample.info[,"Outlier"]==0)
+
+# run analysis
+exp.data <- my.data
+
+### sanity check???
+#head(exp.data)
+
+#write.table(my.data, "MAA_GeneCounts.txt", sep="/t", col.names = T, row.names = F, quote=F)
+rownames(exp.data) <- as.character(exp.data[,1])
+exp.data <- exp.data[,-1]
+exp.data <- exp.data[,use.samples]   # selects data by column names
+
+
+# merge symbol to ENS ID and run
+ENS.to.Symbol <- read.table("Rn6.ENSEMBL.Symbol.txt", sep="\t", header=T, as.is = T, stringsAsFactors = F, comment.char = "#", quote = "")
+#Some reformating was needed
+
+colnames(ENS.to.Symbol)[3] <- "gene_name"
+my.data$gene_name <- rownames(my.data)
+
+my.data.symbol <- merge(my.data, ENS.to.Symbol[,c(1,3)], by="gene_name")
+my.data.symbol$gene_name <- NULL
+#head(my.data.symbol)
+
+my.data.symbol <- my.data.symbol[order(rowSums(my.data.symbol[,c(2:24)]), decreasing = T),]
+
+#removes duplicated rows
+my.data.symbol <- my.data.symbol[which(duplicated(my.data.symbol[,1])==F),]
+
+rownames(my.data.symbol) <- my.data.symbol[,1]
+exp.data <- my.data.symbol[,2:24]
+
+gene.lengths <- vector(length=nrow(exp.data))
+for (index in 1:length(gene.lengths)) {
+  gene.lengths[index] <- as.numeric(exonic.gene.sizes[my.data.symbol[index,"Gene.stable.ID"]])
+}
+
+rpkm.data <- rpkm(exp.data, gene.length=gene.lengths, normalized.lib.sizes=TRUE, log=T, prior.count=.25)
+rpkm.data <- cbind(Gene=rownames(rpkm.data), rpkm.data)
+#write.table(cbind(Gene=rownames(rpkm.data), rpkm.data), "MAA_RPKM.txt", sep="\t", col.names=T, row.names=F)
+
+# covariates
+group <- sample.info[use.samples.rows,"Condition"]
+group <- as.factor(ifelse(grepl("Adj",group)==T,0,1))
+tissue <- sample.info[use.samples.rows,"Region"]
+sex <- sample.info[use.samples.rows,"Sex"]
+lane <- sample.info[use.samples.rows,"Lane"]
+
+
+# edgeR on full
+x <- as.matrix(exp.data[,use.samples])
+rownames(x) <- rownames(exp.data)
+
+y <- DGEList(counts=x,group=group)
+keep <- rowSums(cpm(y)>min.cpm) >= cpm.sample.cutoff
+y <- y[keep, , keep.lib.sizes=FALSE]
+y <- calcNormFactors(y)
+y <- estimateCommonDisp(y)
+y <- estimateTagwiseDisp(y)
+et <- exactTest(y)
+#topTags(et)
+sample.counts <- y$pseudo.counts
+sample.counts <- cbind(Gene=rownames(sample.counts), sample.counts)
+
+#Sex and tissue dissections are used as covariates 
+design <- model.matrix(~as.factor(sex)+ lane +as.factor(tissue)+as.factor(group))
+
+y <- estimateGLMCommonDisp(y,design)
+y <- estimateGLMTrendedDisp(y,design)
+y <- estimateGLMTagwiseDisp(y,design)
+norm.vals <- cpm(y)
+fit <- glmFit(y,design)
+lrt <- glmLRT(fit)
+glm.output.table <- topTags(lrt, n=Inf)
+#topTags(lrt, n=10)
+
+#write.table(glm.output.table$table, "MAA_Full_DE.txt", sep="\t", col.names=T, row.names = T)
+glm.output.table <- cbind(Gene=rownames(glm.output.table$table), glm.output.table$table)
+colnames(glm.output.table) <- paste(colnames(glm.output.table), "All", sep=".")
+colnames(glm.output.table)[1] <- "Gene"
+
+test.counts <- y$pseudo.counts
+pca.results <- prcomp(scale(log(test.counts+1), center=T, scale=T))
+
+```
+
+## MDS plots.
+
+```{r out.width=c('50%', '50%'), fig.show='hold', fig.height = 4, fig.width = 7, error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, dev='png', cache=FALSE}
+
+MDS_data <- plotMDS(y,plot = F)
+MDS_data2 <- data.frame(Leading_logFC_dim_1 = MDS_data$x, Leading_logFC_dim_2=MDS_data$y)
+
+cond <- sample.info[use.samples.rows,"Condition"]
+
+MDS_data2 <- data.frame(Samples=rownames(MDS_data2), 
+                        MDS_data2, 
+                        Conditions_original = cond,
+                        Conditions = ifelse(cond %in% c("Adj-M", "Adj-U"), "Adj", "Imm"),
+                        Group=as.factor(ifelse(grepl("Adj",cond)==T,0,1)), 
+                        Lane = sample.info[use.samples.rows,"Lane"], 
+                        Region= sample.info[use.samples.rows,"Region"],
+                        sex= sample.info[use.samples.rows,"Sex"])
+
+rownames(MDS_data2) <- NULL
+
+MDS_colored_DPC <- ggplot(MDS_data2, aes(x=Leading_logFC_dim_1, y=Leading_logFC_dim_2, shape=Group, colour=Conditions))+
+  geom_point(size=3, alpha=0.6)+
+  theme_bw()+
+  labs(title = "MDS plot")+
+  theme(plot.title = element_text(size = rel(1.5), hjust=0.5))
+
+MDS_colored_DPC
+
+
+MDS_colored_DPC <- ggplot(MDS_data2, aes(x=Leading_logFC_dim_1, y=Leading_logFC_dim_2, colour=as.character(Lane)))+
+  geom_point(size=3, alpha=0.6)+
+  theme_bw()+
+  labs(title = "MDS plot")+
+  theme(plot.title = element_text(size = rel(1.5), hjust=0.5))
+
+MDS_colored_DPC
+```
+
+
+```{r out.width=c('50%', '50%'), fig.show='hold', fig.height = 4, fig.width = 7, error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, dev='png', cache=FALSE}
+
+
+MDS_colored_DPC <- ggplot(MDS_data2, aes(x=Leading_logFC_dim_1, y=Leading_logFC_dim_2, colour=as.character(Region)))+
+  geom_point(size=3, alpha=0.6)+
+  theme_bw()+
+  labs(title = "MDS plot")+
+  theme(plot.title = element_text(size = rel(1.5), hjust=0.5))
+
+MDS_colored_DPC
+
+
+MDS_colored_DPC <- ggplot(MDS_data2, aes(x=Leading_logFC_dim_1, y=Leading_logFC_dim_2, colour=as.character(Region), shape=sex))+
+  geom_point(size=3, alpha=0.6)+
+  theme_bw()+
+  labs(title = "MDS plot")+
+  theme(plot.title = element_text(size = rel(1.5), hjust=0.5))
+
+MDS_colored_DPC
+
+```
+
+## Numbers of DE genes 
+
+```{r RNA-seq 4, fig.height = 8, fig.width = 12, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, dev='png', dpi=72, cache=FALSE, fig.cap=""}
+rownames(glm.output.table) <- NULL
+
+colnames(glm.output.table) <- c("gene_name", "logFC", "logCPM", "LR", "PValue", "FDR")
+
+# Ns of DE genes
+
+P_up_005 <- nrow(filter(glm.output.table, PValue < 0.05, logFC > 0))
+P_down_005 <- nrow(filter(glm.output.table, PValue < 0.05, logFC < 0))
+
+P_up_001 <- nrow(filter(glm.output.table, PValue < 0.01, logFC > 0))
+P_down_001 <- nrow(filter(glm.output.table, PValue < 0.01, logFC < 0))
+
+FDR_up <- nrow(filter(glm.output.table, FDR < 0.05, logFC > 0))
+FDR_down <- nrow(filter(glm.output.table, FDR < 0.05, logFC < 0))
+
+
+DE_df_n <- t(data.frame(
+           "PValue below 0.05" = c(P_up_005, P_down_005),
+           "PValue below 0.01" = c(P_up_001, P_down_001),              
+           "FDR below 0.05" = c(FDR_up, FDR_down)))
+
+colnames(DE_df_n) <- c("Upregulated", "Downregulated")
+
+DE_df_n_melted <- melt(DE_df_n)
+
+
+ggplot(DE_df_n_melted, aes(fill=Var2, x=Var1, y=value))+
+  geom_bar(position="dodge", stat="identity", color="black")+
+  geom_text(aes(label=value), position=position_dodge(width=0.9), vjust=-0.25, size = 8)+
+  theme_bw()+
+  scale_fill_manual(values=brewer.pal(n = 8, name = "Paired")[c(6,2)])+
+  theme(legend.title=element_blank())+
+  labs(title="Number of differentailly expressed genes", x="", y="n of DE genes")+
+  theme(plot.title = element_text(size = rel(2), hjust=0.5))+
+  theme(axis.text.x = element_text(size = 20),
+        axis.text.y = element_text(size = 20),  
+        axis.title.x = element_text(size = 20),
+        axis.title.y = element_text(size = 20),
+        legend.text=element_text(size=20))
+
+```
+
+
+## Volcano plot and DE data table
+
+```{r, fig.height = 10, fig.width = 14, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, cache=FALSE, fig.cap=""}
+#####
+
+volcano_plot_text <- function(x) {
+#x <- glm.output.table
+  
+significance_threshold <- 0.05
+  
+#This is nicely dealing with datasets with missing cathegories.
+test <- ifelse(x$PValue, "Non significant")
+test <- ifelse(x$PValue <0.05, "PValue < 0.05", test)
+test <- ifelse(x$logFC > 1, "logFC > abs(1)", test)
+test <- ifelse(x$logFC < -1, "logFC > abs(1)", test)
+test <- ifelse(x$logFC > 1 & x$PValue <0.05, "PValue < 0.05 & logFC > abs(1)", test)
+test <- ifelse(x$logFC < -1 & x$PValue <0.05, "PValue < 0.05 & logFC > abs(1)", test)
+
+plotDat <- data.frame(x, Group=test)
+
+ggplot(plotDat, aes(x = logFC, y=-log10(PValue), fill=Group, col=Group, label = gene_name)) +
+  geom_point(pch=21, alpha = 0.5, size = 2)+
+  theme_light()+
+  scale_fill_manual(values=c("Non significant"="black", "PValue < 0.05"="orange", "logFC > abs(1)"="green4", "PValue < 0.05 & logFC > abs(1)"="red"))+
+  scale_color_manual(values=c("Non significant"="black", "PValue < 0.05"="orange", "logFC > abs(1)"="green4", "PValue < 0.05 & logFC > abs(1)"="red"))+
+  labs(title= "")+
+  theme(plot.title = element_text(size = rel(2), hjust=0.5))+
+  theme(legend.text=element_text(size=16))+
+  theme(axis.text=element_text(size=14))+
+  theme(legend.title=element_blank())+
+  theme(axis.text=element_text(size=14))+
+  theme(axis.title = element_text(size=14, face = "bold"))+
+  theme(legend.position="bottom")
+
+  #scale_x_continuous(limits = c(-7.5, 7.5))
+
+}
+
+
+p <- volcano_plot_text(glm.output.table)
+ggplotly(p) %>%
+  layout(legend = list(
+      orientation = "h",y = -0.1
+    )
+  )
+
+
+datatable(glm.output.table, rownames = FALSE, filter="top", options = list(pageLength = 15, scrollX=T) )
+
+
+#save.image("G:/Shared drives/Nord Lab - Personal Folders/Karol/MIAx01/MAA_workspace.RData")
+#load("G:/Shared drives/Nord Lab - Personal Folders/Karol/MIAx01/MAA_workspace.RData")
+
+```
+
+## Gene Ontology Biological Process enrichment analysis
+
+```{r, fig.height = 10, fig.width = 14, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, dev='png', dpi=72, cache=TRUE, fig.cap=""}
+
+## Genes with PValue < 0.05
+
+GO_analysis_0.05 <- function(q, b, c) {
+
+library(topGO)
+  background.genes <- q$gene_name
+  geneUniverse <- background.genes
+  
+  if(b=="upregulated"){
+  test.genes <- filter(q, PValue<0.05, logFC > 0)$gene_name
+  } else if (b=="downregulated"){
+    test.genes <- filter(q, PValue<0.05, logFC < 0)$gene_name
+  } else {
+    print("Incorect fold change parameter")
+    stop()
+  }
+
+  genesOfInterest <- test.genes
+  geneList <- factor(as.integer(geneUniverse %in% genesOfInterest))
+  names(geneList) <- geneUniverse
+  myGOdata <- new("topGOdata", description="My project", ontology="BP", allGenes=geneList,  annot=annFUN.org,    mapping="org.Rn.eg.db", ID = "alias", nodeSize=20)
+  print(myGOdata)
+  
+resultFisher <- runTest(myGOdata, algorithm = "weight01", statistic = "fisher")
+#resultKS <- runTest(myGOdata, algorithm = "classic", statistic = "ks")
+#resultKS.elim <- runTest(myGOdata, algorithm = "elim", statistic = "ks")
+#classicKS = resultKS, elimKS = resultKS.elim, - add later
+
+allRes <- GenTable(myGOdata, classicFisher = resultFisher, orderBy = "classicFisher", topNodes = c)
+
+#showSigOfNodes(myGOdata, score(resultKS.elim), firstSigNodes = 5, useInfo = 'all')
+#nodes_plot <- recordPlot(showSigOfNodes(myGOdata, score(resultKS.elim), firstSigNodes = 5, useInfo = 'all'))
+
+padding = 5
+allRes$Enrichment <- log2((allRes$Significant + padding)/(allRes$Expected + padding))
+
+#Building a df of DE genes belonging to top 20 GO BP caegories
+DE_genes_in_top_GO_cat <- function(r){
+ fisher.go <- allRes[r,1]
+ #print(allRes[x,c(1,2)])
+ fisher.ann.genes <- genesInTerm(myGOdata, whichGO=fisher.go)
+ df <- data.frame(GO.ID = allRes[r,c(1)], Term = allRes[r,c(2)], gene_name=intersect(as.character(fisher.ann.genes[[1]]), q$gene_name))
+ df <- filter(df, gene_name %in% test.genes)
+ df
+}
+
+list(allRes, lapply(1:nrow(allRes), DE_genes_in_top_GO_cat))
+}
+
+## Genes with PValue < 0.01
+
+GO_analysis_0.01 <- function(q, b, c) {
+
+library(topGO)
+  background.genes <- q$gene_name
+  geneUniverse <- background.genes
+  
+  if(b=="upregulated"){
+  test.genes <- filter(q, PValue<0.01, logFC > 0)$gene_name
+  } else if (b=="downregulated"){
+    test.genes <- filter(q, PValue<0.01, logFC < 0)$gene_name
+  } else {
+    print("Incorect fold change parameter")
+    stop()
+  }
+
+  genesOfInterest <- test.genes
+  geneList <- factor(as.integer(geneUniverse %in% genesOfInterest))
+  names(geneList) <- geneUniverse
+  myGOdata <- new("topGOdata", description="My project", ontology="BP", allGenes=geneList,  annot=annFUN.org,    mapping="org.Rn.eg.db", ID = "alias", nodeSize=20)
+  print(myGOdata)
+  
+resultFisher <- runTest(myGOdata, algorithm = "weight01", statistic = "fisher")
+#resultKS <- runTest(myGOdata, algorithm = "classic", statistic = "ks")
+#resultKS.elim <- runTest(myGOdata, algorithm = "elim", statistic = "ks")
+#classicKS = resultKS, elimKS = resultKS.elim, - add later
+
+allRes <- GenTable(myGOdata, classicFisher = resultFisher, orderBy = "classicFisher", topNodes = c)
+
+#showSigOfNodes(myGOdata, score(resultKS.elim), firstSigNodes = 5, useInfo = 'all')
+#nodes_plot <- recordPlot(showSigOfNodes(myGOdata, score(resultKS.elim), firstSigNodes = 5, useInfo = 'all'))
+
+padding = 5
+allRes$Enrichment <- log2((allRes$Significant + padding)/(allRes$Expected + padding))
+
+#Building a df of DE genes belonging to top 20 GO BP caegories
+DE_genes_in_top_GO_cat <- function(r){
+ fisher.go <- allRes[r,1]
+ #print(allRes[x,c(1,2)])
+ fisher.ann.genes <- genesInTerm(myGOdata, whichGO=fisher.go)
+ df <- data.frame(GO.ID = allRes[r,c(1)], Term = allRes[r,c(2)], gene_name=intersect(as.character(fisher.ann.genes[[1]]), q$gene_name))
+ df <- filter(df, gene_name %in% test.genes)
+ df
+}
+
+list(allRes, lapply(1:nrow(allRes), DE_genes_in_top_GO_cat))
+}
+
+
+
+GO_up_005 <- GO_analysis_0.05(glm.output.table, "upregulated", 3790)
+GO_down_005 <- GO_analysis_0.05(glm.output.table, "downregulated", 3790)
+
+GO_up_001 <- GO_analysis_0.01(glm.output.table, "upregulated", 3790)
+GO_down_001 <- GO_analysis_0.01(glm.output.table, "downregulated", 3790)
+
+
+#head(GO_up_005[[1]])
+
+```
+
+
+## GO BP enrichment in genes with P value < 0.05
+### Upregulated
+```{r, fig.height = 10, fig.width = 14, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, dev='png', dpi=72, cache=FALSE, fig.cap=""}
+
+
+x_1 <- filter(GO_up_005[[1]], classicFisher < 0.05, Enrichment > 0)
+datatable(x_1, rownames = FALSE, filter="top", options = list(pageLength = 15, scrollX=T))
+
+datatable(filter(rbindlist(GO_up_005[[2]]), Term %in% x_1$Term), rownames = FALSE, filter="top", options = list(pageLength = 15, scrollX=T))
+
+```
+
+### Downregulated
+```{r, fig.height = 10, fig.width = 14, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, dev='png', dpi=72, cache=FALSE, fig.cap=""}
+
+
+x_2 <- filter(GO_down_005[[1]], classicFisher < 0.05, Enrichment > 0)
+datatable(x_2, rownames = FALSE, filter="top", options = list(pageLength = 15, scrollX=T))
+
+
+datatable(filter(rbindlist(GO_down_005[[2]]), Term %in% x_2$Term), rownames = FALSE, filter="top", options = list(pageLength = 15, scrollX=T))
+
+```
+
+## GO BP enrichment in genes with P value < 0.01
+### Upregulated
+```{r, fig.height = 10, fig.width = 14, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, dev='png', dpi=72, cache=FALSE, fig.cap=""}
+
+x_3 <- filter(GO_up_001[[1]], classicFisher < 0.05, Enrichment > 0)
+datatable(x_3, rownames = FALSE, filter="top", options = list(pageLength = 15, scrollX=T))
+
+datatable(filter(rbindlist(GO_up_001[[2]]), Term %in% x_3$Term), rownames = FALSE, filter="top", options = list(pageLength = 15, scrollX=T))
+
+```
+
+### Downregulated
+```{r, fig.height = 10, fig.width = 14, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, dev='png', dpi=72, cache=FALSE, fig.cap=""}
+
+x_4 <- filter(GO_down_001[[1]], classicFisher < 0.05, Enrichment > 0)
+datatable(x_4, rownames = FALSE, filter="top", options = list(pageLength = 15, scrollX=T))
+
+datatable(filter(rbindlist(GO_down_001[[2]]), Term %in% x_4$Term), rownames = FALSE, filter="top", options = list(pageLength = 15, scrollX=T))
+
+
+```
+
+
+# RNA-Seq differential expression of MAA model, without "frontal cortex" samples 
+
+Dataset includes: "Extracted frontal cortex only", and "Forebrain" samples 
+
+```{r RNA-seq 6, fig.height = 10, fig.width = 14, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, dev='png', dpi=72, cache=FALSE, fig.cap=""}
+
+setwd("G:/Shared drives/Nord Lab - Personal Folders/Karol/MIAx01/RNA")
+# details on each sample
+sample.info <- read.table("MAA_SampleInfo_complete.txt", sep="\t", header=T, as.is=T, stringsAsFactors = F)
+
+#In addition to frontal cortex I'm adding Forebrain samples. There are no frontal cortex samples in the new batch. I had to manually add 0s to the outlier columns, because I haven't found the original information in metafiles yet. 
+
+#There are the following brain regions in the dataset: 
+#[1] "frontal cortex"                "whole brain"                  
+#[3] "Extracted frontal cortex only" "Forebrain"      
+
+
+# select samples for analysis
+use.samples_2 <- sample.info[which(sample.info[,"Region"] %in% c("frontal cortex", "Extracted frontal cortex only") & sample.info[,"Outlier"]==0),"Sample_ID"]
+
+
+use.samples_2.rows <- which(sample.info[,"Region"] %in% c("frontal cortex", "Extracted frontal cortex only") & sample.info[,"Outlier"]==0)
+
+# run analysis
+exp.data_2 <- my.data
+
+### sanity check???
+#head(exp.data_2)
+
+
+#write.table(my.data, "MAA_GeneCounts.txt", sep="/t", col.names = T, row.names = F, quote=F)
+rownames(exp.data_2) <- as.character(exp.data_2[,1])
+exp.data_2 <- exp.data_2[,-1]
+exp.data_2 <- exp.data_2[,use.samples_2]   # selects data by column names
+
+setwd("G:/Shared drives/Nord Lab - Data/MIAx01/RNA")
+# merge symbol to ENS ID and run
+ENS.to.Symbol <- read.table("Rn6.ENSEMBL.Symbol.txt", sep="\t", header=T, as.is = T, stringsAsFactors = F, comment.char = "#", quote = "")
+#Some reformating was needed
+
+colnames(ENS.to.Symbol)[3] <- "gene_name"
+my.data$gene_name <- rownames(my.data)
+
+my.data.symbol <- merge(my.data, ENS.to.Symbol[,c(1,3)], by="gene_name")
+my.data.symbol$gene_name <- NULL
+#head(my.data.symbol)
+
+my.data.symbol <- my.data.symbol[order(rowSums(my.data.symbol[,c(2:24)]), decreasing = T),]
+
+#removes duplicated rows
+my.data.symbol <- my.data.symbol[which(duplicated(my.data.symbol[,1])==F),]
+
+rownames(my.data.symbol) <- my.data.symbol[,1]
+exp.data_2 <- my.data.symbol[,2:24]
+
+gene.lengths <- vector(length=nrow(exp.data_2))
+for (index in 1:length(gene.lengths)) {
+  gene.lengths[index] <- as.numeric(exonic.gene.sizes[my.data.symbol[index,"Gene.stable.ID"]])
+}
+
+rpkm.data_2 <- rpkm(exp.data_2, gene.length=gene.lengths, normalized.lib.sizes=TRUE, log=T, prior.count=.25)
+rpkm.data_2 <- cbind(Gene=rownames(rpkm.data_2), rpkm.data_2)
+#write.table(cbind(Gene=rownames(rpkm.data_2), rpkm.data_2), "MAA_RPKM.txt", sep="\t", col.names=T, row.names=F)
+
+# covariates
+group <- sample.info[use.samples_2.rows,"Condition"]
+group <- as.factor(ifelse(grepl("Adj",group)==T,0,1))
+tissue <- sample.info[use.samples_2.rows,"Region"]
+sex <- sample.info[use.samples_2.rows,"Sex"]
+lane <- sample.info[use.samples_2.rows,"Lane"]
+
+
+# edgeR on full
+x <- as.matrix(exp.data_2[,use.samples_2])
+rownames(x) <- rownames(exp.data_2)
+
+y <- DGEList(counts=x,group=group)
+keep <- rowSums(cpm(y)>min.cpm) >= cpm.sample.cutoff
+y <- y[keep, , keep.lib.sizes=FALSE]
+y <- calcNormFactors(y)
+y <- estimateCommonDisp(y)
+y <- estimateTagwiseDisp(y)
+et <- exactTest(y)
+#topTags(et)
+sample.counts <- y$pseudo.counts
+sample.counts <- cbind(Gene=rownames(sample.counts), sample.counts)
+
+design <- model.matrix(~as.factor(sex)+as.factor(tissue)+lane+as.factor(group))
+
+
+y <- estimateGLMCommonDisp(y,design)
+y <- estimateGLMTrendedDisp(y,design)
+y <- estimateGLMTagwiseDisp(y,design)
+norm.vals <- cpm(y)
+fit <- glmFit(y,design)
+lrt <- glmLRT(fit)
+glm.output.table_2 <- topTags(lrt, n=Inf)
+#topTags(lrt, n=10)
+
+#write.table(glm.output.table_2$table, "MAA_Full_DE.txt", sep="\t", col.names=T, row.names = T)
+glm.output.table_2 <- cbind(Gene=rownames(glm.output.table_2$table), glm.output.table_2$table)
+colnames(glm.output.table_2) <- paste(colnames(glm.output.table_2), "All", sep=".")
+colnames(glm.output.table_2)[1] <- "Gene"
+
+test.counts <- y$pseudo.counts
+pca.results <- prcomp(scale(log(test.counts+1), center=T, scale=T))
+
+
+```
+
+## MDS plots
+
+```{r out.width=c('50%', '50%'), fig.show='hold', fig.height = 4, fig.width = 7, error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, dev='png', cache=FALSE}
+
+
+MDS_data <- plotMDS(y,plot = F)
+MDS_data2 <- data.frame(Leading_logFC_dim_1 = MDS_data$x, Leading_logFC_dim_2=MDS_data$y)
+
+cond <- sample.info[use.samples_2.rows,"Condition"]
+
+MDS_data2 <- data.frame(Samples=rownames(MDS_data2), 
+                        MDS_data2, 
+                        Conditions_original = cond,
+                        Conditions = ifelse(cond %in% c("Adj-M", "Adj-U"), "Adj", "Imm"),
+                        Group=as.factor(ifelse(grepl("Adj",cond)==T,0,1)),  
+                        Lane = sample.info[use.samples_2.rows,"Lane"], 
+                        Region= sample.info[use.samples_2.rows,"Region"],
+                        sex= sample.info[use.samples_2.rows,"Sex"])
+
+rownames(MDS_data2) <- NULL
+
+MDS_colored_DPC <- ggplot(MDS_data2, aes(x=Leading_logFC_dim_1, y=Leading_logFC_dim_2, shape=group, colour=Conditions))+
+  geom_point(size=3, alpha=0.6)+
+  theme_bw()+
+  labs(title = "MDS plot")+
+  theme(plot.title = element_text(size = rel(1.5), hjust=0.5))
+
+MDS_colored_DPC
+
+
+MDS_colored_DPC <- ggplot(MDS_data2, aes(x=Leading_logFC_dim_1, y=Leading_logFC_dim_2, colour=as.character(Lane)))+
+  geom_point(size=3, alpha=0.6)+
+  theme_bw()+
+  labs(title = "MDS plot")+
+  theme(plot.title = element_text(size = rel(1.5), hjust=0.5))
+
+MDS_colored_DPC
+
+```
+
+
+```{r out.width=c('50%', '50%'), fig.show='hold', fig.height = 4, fig.width = 7, error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, dev='png', cache=FALSE}
+
+MDS_colored_DPC <- ggplot(MDS_data2, aes(x=Leading_logFC_dim_1, y=Leading_logFC_dim_2, colour=as.character(Region)))+
+  geom_point(size=3, alpha=0.6)+
+  theme_bw()+
+  labs(title = "MDS plot")+
+  theme(plot.title = element_text(size = rel(1.5), hjust=0.5))
+
+MDS_colored_DPC
+
+
+MDS_colored_DPC <- ggplot(MDS_data2, aes(x=Leading_logFC_dim_1, y=Leading_logFC_dim_2, colour=as.character(Region), shape=sex))+
+  geom_point(size=3, alpha=0.6)+
+  theme_bw()+
+  labs(title = "MDS plot")+
+  theme(plot.title = element_text(size = rel(1.5), hjust=0.5))
+
+MDS_colored_DPC
+
+```
+
+## Numbers of DE genes 
+
+```{r RNA-seq 8, fig.height = 8, fig.width = 12, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, dev='png', dpi=72, cache=FALSE, fig.cap=""}
+rownames(glm.output.table_2) <- NULL
+
+colnames(glm.output.table_2) <- c("gene_name", "logFC", "logCPM", "LR", "PValue", "FDR")
+
+# Ns of DE genes
+
+P_up_005 <- nrow(filter(glm.output.table_2, PValue < 0.05, logFC > 0))
+P_down_005 <- nrow(filter(glm.output.table_2, PValue < 0.05, logFC < 0))
+
+P_up_001 <- nrow(filter(glm.output.table_2, PValue < 0.01, logFC > 0))
+P_down_001 <- nrow(filter(glm.output.table_2, PValue < 0.01, logFC < 0))
+
+FDR_up <- nrow(filter(glm.output.table_2, FDR < 0.05, logFC > 0))
+FDR_down <- nrow(filter(glm.output.table_2, FDR < 0.05, logFC < 0))
+
+
+DE_df_n <- t(data.frame(
+           "PValue below 0.05" = c(P_up_005, P_down_005),
+           "PValue below 0.01" = c(P_up_001, P_down_001),              
+           "FDR below 0.05" = c(FDR_up, FDR_down)))
+
+colnames(DE_df_n) <- c("Upregulated", "Downregulated")
+
+DE_df_n_melted <- melt(DE_df_n)
+
+ggplot(DE_df_n_melted, aes(fill=Var2, x=Var1, y=value))+
+  geom_bar(position="dodge", stat="identity", color="black")+
+  geom_text(aes(label=value), position=position_dodge(width=0.9), vjust=-0.25, size = 8)+
+  theme_bw()+
+  scale_fill_manual(values=brewer.pal(n = 8, name = "Paired")[c(6,2)])+
+  theme(legend.title=element_blank())+
+  labs(title="Number of differentailly expressed genes", x="", y="n of DE genes")+
+  theme(plot.title = element_text(size = rel(2), hjust=0.5))+
+  theme(axis.text.x = element_text(size = 20),
+        axis.text.y = element_text(size = 20),  
+        axis.title.x = element_text(size = 20),
+        axis.title.y = element_text(size = 20),
+        legend.text=element_text(size=20))
+
+
+```
+
+## Volcano plot and DE data table
+
+```{r, fig.height = 10, fig.width = 14, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, cache=FALSE, fig.cap=""}
+#####
+
+volcano_plot_text <- function(x) {
+#x <- glm.output.table_2
+  
+significance_threshold <- 0.05
+  
+#This is nicely dealing with datasets with missing cathegories.
+test <- ifelse(x$PValue, "Non significant")
+test <- ifelse(x$PValue <0.05, "PValue < 0.05", test)
+test <- ifelse(x$logFC > 1, "logFC > abs(1)", test)
+test <- ifelse(x$logFC < -1, "logFC > abs(1)", test)
+test <- ifelse(x$logFC > 1 & x$PValue <0.05, "PValue < 0.05 & logFC > abs(1)", test)
+test <- ifelse(x$logFC < -1 & x$PValue <0.05, "PValue < 0.05 & logFC > abs(1)", test)
+
+plotDat <- data.frame(x, Group=test)
+
+ggplot(plotDat, aes(x = logFC, y=-log10(PValue), fill=Group, col=Group, label = gene_name)) +
+  geom_point(pch=21, alpha = 0.5, size = 2)+
+  theme_light()+
+  scale_fill_manual(values=c("Non significant"="black", "PValue < 0.05"="orange", "logFC > abs(1)"="green4", "PValue < 0.05 & logFC > abs(1)"="red"))+
+  scale_color_manual(values=c("Non significant"="black", "PValue < 0.05"="orange", "logFC > abs(1)"="green4", "PValue < 0.05 & logFC > abs(1)"="red"))+
+  labs(title= "")+
+  theme(plot.title = element_text(size = rel(2), hjust=0.5))+
+  theme(legend.text=element_text(size=16))+
+  theme(axis.text=element_text(size=14))+
+  theme(legend.title=element_blank())+
+  theme(axis.text=element_text(size=14))+
+  theme(axis.title = element_text(size=14, face = "bold"))+
+  theme(legend.position="bottom")
+
+  #scale_x_continuous(limits = c(-7.5, 7.5))
+
+}
+
+
+p <- volcano_plot_text(glm.output.table_2)
+ggplotly(p) %>%
+  layout(legend = list(
+      orientation = "h",y = -0.1
+    )
+  )
+
+
+datatable(glm.output.table_2, rownames = FALSE, filter="top", options = list(pageLength = 15, scrollX=T) )
+
+
+#save.image("G:/Shared drives/Nord Lab - Personal Folders/Karol/MIAx01/MAA_workspace.RData")
+#load("G:/Shared drives/Nord Lab - Personal Folders/Karol/MIAx01/MAA_workspace.RData")
+
+```
+
+
+## Gene Ontology Biological Process enrichment analysis
+
+```{r RNA-seq 10, fig.height = 10, fig.width = 14, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, dev='png', dpi=72, cache=TRUE, fig.cap=""}
+
+## Genes with PValue < 0.05
+
+GO_analysis_0.05 <- function(q, b, c) {
+
+library(topGO)
+  background.genes <- q$gene_name
+  geneUniverse <- background.genes
+  
+  if(b=="upregulated"){
+  test.genes <- filter(q, PValue<0.05, logFC > 0)$gene_name
+  } else if (b=="downregulated"){
+    test.genes <- filter(q, PValue<0.05, logFC < 0)$gene_name
+  } else {
+    print("Incorect fold change parameter")
+    stop()
+  }
+
+  genesOfInterest <- test.genes
+  geneList <- factor(as.integer(geneUniverse %in% genesOfInterest))
+  names(geneList) <- geneUniverse
+  myGOdata <- new("topGOdata", description="My project", ontology="BP", allGenes=geneList,  annot=annFUN.org,    mapping="org.Rn.eg.db", ID = "alias", nodeSize=20)
+  print(myGOdata)
+  
+resultFisher <- runTest(myGOdata, algorithm = "weight01", statistic = "fisher")
+#resultKS <- runTest(myGOdata, algorithm = "classic", statistic = "ks")
+#resultKS.elim <- runTest(myGOdata, algorithm = "elim", statistic = "ks")
+#classicKS = resultKS, elimKS = resultKS.elim, - add later
+
+allRes <- GenTable(myGOdata, classicFisher = resultFisher, orderBy = "classicFisher", topNodes = c)
+
+#showSigOfNodes(myGOdata, score(resultKS.elim), firstSigNodes = 5, useInfo = 'all')
+#nodes_plot <- recordPlot(showSigOfNodes(myGOdata, score(resultKS.elim), firstSigNodes = 5, useInfo = 'all'))
+
+padding = 5
+allRes$Enrichment <- log2((allRes$Significant + padding)/(allRes$Expected + padding))
+
+#Building a df of DE genes belonging to top 20 GO BP caegories
+DE_genes_in_top_GO_cat <- function(r){
+ fisher.go <- allRes[r,1]
+ #print(allRes[x,c(1,2)])
+ fisher.ann.genes <- genesInTerm(myGOdata, whichGO=fisher.go)
+ df <- data.frame(GO.ID = allRes[r,c(1)], Term = allRes[r,c(2)], gene_name=intersect(as.character(fisher.ann.genes[[1]]), q$gene_name))
+ df <- filter(df, gene_name %in% test.genes)
+ df
+}
+
+list(allRes, lapply(1:nrow(allRes), DE_genes_in_top_GO_cat))
+}
+
+## Genes with PValue < 0.01
+
+GO_analysis_0.01 <- function(q, b, c) {
+
+library(topGO)
+  background.genes <- q$gene_name
+  geneUniverse <- background.genes
+  
+  if(b=="upregulated"){
+  test.genes <- filter(q, PValue<0.01, logFC > 0)$gene_name
+  } else if (b=="downregulated"){
+    test.genes <- filter(q, PValue<0.01, logFC < 0)$gene_name
+  } else {
+    print("Incorect fold change parameter")
+    stop()
+  }
+
+  genesOfInterest <- test.genes
+  geneList <- factor(as.integer(geneUniverse %in% genesOfInterest))
+  names(geneList) <- geneUniverse
+  myGOdata <- new("topGOdata", description="My project", ontology="BP", allGenes=geneList,  annot=annFUN.org,    mapping="org.Rn.eg.db", ID = "alias", nodeSize=20)
+  print(myGOdata)
+  
+resultFisher <- runTest(myGOdata, algorithm = "weight01", statistic = "fisher")
+#resultKS <- runTest(myGOdata, algorithm = "classic", statistic = "ks")
+#resultKS.elim <- runTest(myGOdata, algorithm = "elim", statistic = "ks")
+#classicKS = resultKS, elimKS = resultKS.elim, - add later
+
+allRes <- GenTable(myGOdata, classicFisher = resultFisher, orderBy = "classicFisher", topNodes = c)
+
+#showSigOfNodes(myGOdata, score(resultKS.elim), firstSigNodes = 5, useInfo = 'all')
+#nodes_plot <- recordPlot(showSigOfNodes(myGOdata, score(resultKS.elim), firstSigNodes = 5, useInfo = 'all'))
+
+padding = 5
+allRes$Enrichment <- log2((allRes$Significant + padding)/(allRes$Expected + padding))
+
+#Building a df of DE genes belonging to top 20 GO BP caegories
+DE_genes_in_top_GO_cat <- function(r){
+ fisher.go <- allRes[r,1]
+ #print(allRes[x,c(1,2)])
+ fisher.ann.genes <- genesInTerm(myGOdata, whichGO=fisher.go)
+ df <- data.frame(GO.ID = allRes[r,c(1)], Term = allRes[r,c(2)], gene_name=intersect(as.character(fisher.ann.genes[[1]]), q$gene_name))
+ df <- filter(df, gene_name %in% test.genes)
+ df
+}
+
+list(allRes, lapply(1:nrow(allRes), DE_genes_in_top_GO_cat))
+}
+
+
+
+GO_up_005 <- GO_analysis_0.05(glm.output.table_2, "upregulated", 3777)
+GO_down_005 <- GO_analysis_0.05(glm.output.table_2, "downregulated", 3777)
+
+GO_up_001 <- GO_analysis_0.01(glm.output.table_2, "upregulated", 3777)
+GO_down_001 <- GO_analysis_0.01(glm.output.table_2, "downregulated", 3777)
+
+
+#head(GO_up_005[[1]])
+
+```
+
+
+## GO BP enrichment in genes with P value < 0.05
+### Upregulated
+```{r RNA-seq 11, fig.height = 10, fig.width = 14, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, dev='png', dpi=72, cache=FALSE, fig.cap=""}
+
+
+x_1 <- filter(GO_up_005[[1]], classicFisher < 0.05, Enrichment > 0)
+datatable(x_1, rownames = FALSE, filter="top", options = list(pageLength = 15, scrollX=T))
+
+datatable(filter(rbindlist(GO_up_005[[2]]), Term %in% x_1$Term), rownames = FALSE, filter="top", options = list(pageLength = 15, scrollX=T))
+
+```
+
+### Downregulated
+```{r RNA-seq 12, fig.height = 10, fig.width = 14, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, dev='png', dpi=72, cache=FALSE, fig.cap=""}
+
+
+x_2 <- filter(GO_down_005[[1]], classicFisher < 0.05, Enrichment > 0)
+datatable(x_2, rownames = FALSE, filter="top", options = list(pageLength = 15, scrollX=T))
+
+
+datatable(filter(rbindlist(GO_down_005[[2]]), Term %in% x_2$Term), rownames = FALSE, filter="top", options = list(pageLength = 15, scrollX=T))
+
+```
+
+## GO BP enrichment in genes with P value < 0.01
+### Upregulated
+```{r RNA-seq 13, fig.height = 10, fig.width = 14, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, dev='png', dpi=72, cache=FALSE, fig.cap=""}
+
+x_3 <- filter(GO_up_001[[1]], classicFisher < 0.05, Enrichment > 0)
+datatable(x_3, rownames = FALSE, filter="top", options = list(pageLength = 15, scrollX=T))
+
+datatable(filter(rbindlist(GO_up_001[[2]]), Term %in% x_3$Term), rownames = FALSE, filter="top", options = list(pageLength = 15, scrollX=T))
+
+```
+
+### Downregulated
+```{r RNA-seq 14, fig.height = 10, fig.width = 14, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, dev='png', dpi=72, cache=FALSE, fig.cap=""}
+
+x_4 <- filter(GO_down_001[[1]], classicFisher < 0.05, Enrichment > 0)
+datatable(x_4, rownames = FALSE, filter="top", options = list(pageLength = 15, scrollX=T))
+
+datatable(filter(rbindlist(GO_down_001[[2]]), Term %in% x_4$Term), rownames = FALSE, filter="top", options = list(pageLength = 15, scrollX=T))
+
+```
+
+
+
+## RPKM plots, top 30 genes in the analysis with the forebrain samples
+
+```{r, fig.height = 40, fig.width = 20, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, dev='png', dpi=72, cache=FALSE, fig.cap=""}
+
+rpkm.data_linear <- rpkm(exp.data, gene.length=gene.lengths, log=F)
+
+sample.info_clean <- sample.info[use.samples.rows,]
+
+sample.info$Condition2 <- as.character(ifelse(grepl("Adj",sample.info$Condition)==T, "Adj","Imm"))
+
+#This is some ugly coding, but works correctly.
+ed <- rpkm(exp.data[,use.samples], gene.length=gene.lengths, log=F) 
+rpkm.batch <- removeBatchEffect(ed, 
+                                batch = sample.info$Region[use.samples.rows], 
+                                design = cbind(
+                                  sample.info$Lane[use.samples.rows], 
+                                  as.factor(sample.info$Sex)[use.samples.rows], 
+                                  as.factor(sample.info$Condition2)[use.samples.rows]))
+
+rpkm.data_linear_clean <- rpkm.batch
+
+
+#rpkm.data_linear_clean <- rpkm.data_linear[,use.samples]
+
+
+sample.info_clean$Condition2 <- as.character(ifelse(grepl("Adj",sample.info_clean$Condition)==T, "Adj","Imm"))
+
+rpkm_box_plot <- function(x){
+rpkm_test <- as.data.frame(melt(rpkm.data_linear_clean[x,]))
+rpkm_test_w_info <- cbind(rpkm_test, sample.info_clean[,"Condition2"])
+rpkm_test_w_info <- cbind(rpkm_test_w_info, sample.info_clean[,"Region"])
+
+colnames(rpkm_test_w_info) <- c("RPKM", "Condition", "Region")
+
+#j_brew_colors <- brewer.pal(n = 8, name = "Paired")[c(2,6)]
+j_brew_colors <- c("#1F78B4", "#33A02C", "#E31A1C")
+
+ggplot(rpkm_test_w_info)+
+  geom_boxplot(aes(x = Condition, y= RPKM, colour=Condition), alpha=0.3, position="identity")+
+  geom_jitter(aes(x = Condition, y= RPKM, fill=Region), size=4, alpha=0.6, pch=21, width = 0.2)+
+  theme_bw()+
+  geom_smooth(method = "loess", se=T, aes(x = Condition, y= RPKM, fill=Condition,  group=Condition), size  = 1, alpha=0.1)+
+  theme(axis.text.x=element_text(angle=50, vjust=0.9, hjust=1, size=12, face="bold"))+
+  labs(title= x, x="")+
+  theme(plot.title = element_text(size = rel(2), hjust=0.5))+
+  scale_fill_manual(values = j_brew_colors)+
+  scale_colour_manual(values = brewer.pal(n = 8, name = "Paired")[c(2,6, 3)])+
+  theme(plot.title = element_text(size = rel(2), hjust=0.5))+
+  theme(axis.text.x = element_text(size = 20),
+        axis.text.y = element_text(size = 20),  
+        axis.title.x = element_text(size = 20),
+        axis.title.y = element_text(size = 20),
+        legend.text = element_text(size=20),
+        legend.title = element_text(size=20))
+}
+
+#rpkm_box_plot(glm.output.table_2$gene_name[5])
+
+pl <- lapply(glm.output.table$gene_name[1:30], function(x) rpkm_box_plot(x))
+ml <- marrangeGrob(pl, nrow=10, ncol=3, top = "")
+ml
+
+#save.image("G:/Shared drives/Nord Lab - Personal Folders/Karol/MIAx01/index.RData")
+
+```
+
+
+
+
+## RPKM plots, top 30 genes in the analysis without the forebrain samples
+
+```{r, fig.height = 40, fig.width = 20, fig.align = 'center', error=FALSE, warning=FALSE, message=FALSE, echo=TRUE, dev='png', dpi=72, cache=FALSE, fig.cap=""}
+
+rpkm.data_linear_2 <- rpkm(exp.data_2, gene.length=gene.lengths, log=F)
+
+#This is some ugly coding, but works correctly.
+ed <- rpkm(exp.data_2[,use.samples_2], gene.length=gene.lengths, log=F) 
+rpkm.batch <- removeBatchEffect(ed, 
+                                batch = sample.info_clean$Region[use.samples_2.rows], 
+                                design = cbind(
+                                  sample.info_clean$Lane[use.samples_2.rows], 
+                                  as.factor(sample.info_clean$Sex)[use.samples_2.rows], 
+                                  as.factor(sample.info_clean$Condition2)[use.samples_2.rows]))
+
+rpkm.data_linear_clean <- rpkm.batch
+
+
+#rpkm.data_linear_clean <- rpkm.data_linear_2[,use.samples_2]
+sample.info_clean <- sample.info[use.samples_2.rows,]
+
+sample.info_clean$Condition2 <- as.character(ifelse(grepl("Adj",sample.info_clean$Condition)==T, "Adj","Imm"))
+
+
+rpkm_box_plot <- function(x){
+rpkm_test <- as.data.frame(melt(rpkm.data_linear_clean[x,]))
+rpkm_test_w_info <- cbind(rpkm_test, sample.info_clean[,"Condition2"])
+rpkm_test_w_info <- cbind(rpkm_test_w_info, sample.info_clean[,"Region"])
+
+colnames(rpkm_test_w_info) <- c("RPKM", "Condition", "Region")
+
+#j_brew_colors <- brewer.pal(n = 8, name = "Paired")[c(2,6)]
+j_brew_colors <- c("#1F78B4", "#33A02C", "#E31A1C")
+
+ggplot(rpkm_test_w_info)+
+  geom_boxplot(aes(x = Condition, y= RPKM, colour=Condition), alpha=0.3, position="identity")+
+  geom_jitter(aes(x = Condition, y= RPKM, fill=Region), size=4, alpha=0.6, pch=21, width = 0.2)+
+  theme_bw()+
+  geom_smooth(method = "loess", se=T, aes(x = Condition, y= RPKM, fill=Condition,  group=Condition), size  = 1, alpha=0.1)+
+  theme(axis.text.x=element_text(angle=50, vjust=0.9, hjust=1, size=12, face="bold"))+
+  labs(title= x, x="")+
+  theme(plot.title = element_text(size = rel(2), hjust=0.5))+
+  scale_fill_manual(values = j_brew_colors)+
+  scale_colour_manual(values = brewer.pal(n = 8, name = "Paired")[c(2,6, 3)])+
+  theme(plot.title = element_text(size = rel(2), hjust=0.5))+
+  theme(axis.text.x = element_text(size = 20),
+        axis.text.y = element_text(size = 20),  
+        axis.title.x = element_text(size = 20),
+        axis.title.y = element_text(size = 20),
+        legend.text = element_text(size=20),
+        legend.title = element_text(size=20))
+}
+
+#rpkm_box_plot(glm.output.table_2$gene_name[5])
+
+#colnames(glm.output.table) <- c("gene_name", "logFC", "logCPM", "LR", "PValue", "FDR")
+
+pl <- lapply(glm.output.table_2$gene_name[1:30], function(x) rpkm_box_plot(x))
+ml <- marrangeGrob(pl, nrow=10, ncol=3, top = "")
+ml
+
+```
+
